@@ -11,6 +11,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
+// rs 锁的过期心跳时间（当前集群时间戳 - Heartbeat > StaleFrameSec 则认为锁过期）
 const StaleFrameSec uint32 = 30
 
 // LockHeader describes the lock. This data will be serialased into the mongo document.
@@ -25,8 +26,10 @@ type LockHeader struct {
 }
 
 type LockData struct {
+	// 描述某个 rs 的锁定情况
 	LockHeader `bson:",inline"`
-	Heartbeat  primitive.Timestamp `bson:"hb"` // separated in order the lock can be searchable by the header
+	// 锁的心跳时间
+	Heartbeat primitive.Timestamp `bson:"hb"` // separated in order the lock can be searchable by the header
 }
 
 // Lock is a lock for the PBM operation (e.g. backup, restore)
@@ -266,6 +269,7 @@ func (l *Lock) acquire() (bool, error) {
 		return false, errors.Wrap(err, "acquire lock")
 	}
 
+	// 创建一个心跳协程维持锁的状态（一直更新一个时间戳）
 	l.hb()
 	return true, nil
 }

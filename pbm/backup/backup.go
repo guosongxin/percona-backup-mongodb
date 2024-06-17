@@ -352,6 +352,10 @@ func NodeSuits(node *pbm.Node, inf *pbm.NodeInfo) (bool, error) {
 		return false, errors.Wrap(err, "get node replication lag")
 	}
 
+	// 如果节点满足以下条件视为合适备份：
+	// 1. 节点复制延迟小于 maxReplicationLagTimeSec
+	// 2. 节点健康
+	// 3. 节点类型为 Primary | Secondary
 	return replLag < maxReplicationLagTimeSec && status.Health == pbm.NodeHealthUp &&
 			(status.State == pbm.NodeStatePrimary || status.State == pbm.NodeStateSecondary),
 		nil

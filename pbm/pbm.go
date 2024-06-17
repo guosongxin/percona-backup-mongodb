@@ -176,6 +176,7 @@ type RestoreCmd struct {
 	Namespaces []string          `bson:"nss,omitempty"`
 	RSMap      map[string]string `bson:"rsMap,omitempty"`
 
+	// 按时间点恢复的 oplog 结束时间
 	OplogTS primitive.Timestamp `bson:"oplogTS,omitempty"`
 
 	External bool                `bson:"external"`
@@ -803,6 +804,9 @@ func (p *PBM) LastIncrementalBackup() (*BackupMeta, error) {
 // GetLastBackup returns last successfully finished backup (non-selective and non-external)
 // or nil if there is no such backup yet. If ts isn't nil it will
 // search for the most recent backup that finished before specified timestamp
+//
+// GetLastBackup 返回最后一次成功完成的备份（除了 ExternalBackup 备份类型外的备份），如果尚没有此类备份，则返回 nil。
+// 如果 ts 不为零，它将搜索在指定时间戳之前完成的最新备份
 func (p *PBM) GetLastBackup(before *primitive.Timestamp) (*BackupMeta, error) {
 	return p.getRecentBackup(nil, before, -1,
 		bson.D{{"nss", nil}, {"type", bson.M{"$ne": ExternalBackup}}})
@@ -813,6 +817,7 @@ func (p *PBM) GetFirstBackup(after *primitive.Timestamp) (*BackupMeta, error) {
 		bson.D{{"nss", nil}, {"type", bson.M{"$ne": ExternalBackup}}})
 }
 
+// 从 pbmBackups 表中搜索 [after, before] 时间内的最新的备份
 func (p *PBM) getRecentBackup(after, before *primitive.Timestamp, sort int, opts bson.D) (*BackupMeta, error) {
 	q := append(bson.D{}, opts...)
 	q = append(q, bson.E{"status", StatusDone})

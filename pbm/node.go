@@ -176,6 +176,7 @@ func (n *Node) GetReplsetStatus() (*ReplsetStatus, error) {
 	return GetReplsetStatus(n.ctx, n.cn)
 }
 
+// 获取当前节点对于所在 replset 的状态（脱离了 rs？）
 func (n *Node) Status() (*NodeStatus, error) {
 	s, err := n.GetReplsetStatus()
 	if err != nil {

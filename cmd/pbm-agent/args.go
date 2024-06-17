@@ -11,6 +11,7 @@ import (
 
 const mauthPrefix = "--" + mongoConnFlag + "="
 
+// 设置命令行参数 os.Args 中指定索引位置的值的函数
 func setarg(i int, as string) {
 	ptr := (*reflect.StringHeader)(unsafe.Pointer(&os.Args[i]))
 	arg := (*[1 << 30]byte)(unsafe.Pointer(ptr.Data))[:ptr.Len]

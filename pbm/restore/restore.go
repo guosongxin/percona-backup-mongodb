@@ -231,10 +231,12 @@ func chunks(
 		return nil, errors.Wrap(err, "get chunks index")
 	}
 
+	// 没有找到 oplog 文件
 	if len(chunks) == 0 {
 		return nil, errors.New("no chunks found")
 	}
 
+	// 检查最后一个 oplog 可恢复到的时间点小于需要的时间点
 	if chunks[len(chunks)-1].EndTS.Compare(to) == -1 {
 		return nil, errors.Errorf(
 			"no chunk with the target time, the last chunk ends on %v",
@@ -243,6 +245,7 @@ func chunks(
 
 	last := from
 	for _, c := range chunks {
+		// 检查 oplog 块中是否存在间隙
 		if last.Compare(c.StartTS) == -1 {
 			return nil, errors.Errorf(
 				"integrity vilolated, expect chunk with start_ts %v, but got %v",
@@ -250,6 +253,7 @@ func chunks(
 		}
 		last = c.EndTS
 
+		// 尝试获取以下文件 oplog 文件的状态，检查是否能够成功获取
 		_, err := stg.FileStat(c.FName)
 		if err != nil {
 			return nil, errors.Errorf(
@@ -273,6 +277,18 @@ type (
 	setcommittedTxnFn func(txn []pbm.RestoreTxn) error
 	getcommittedTxnFn func() (map[string]primitive.Timestamp, error)
 )
+
+// 通过仅查看 oplog 中的事务，我们无法判断哪些分片参与其中。但我们可以假设，如果至少在一个分片上存在 commitTransaction，
+// 则该事务将在所有地方提交。否则，事务将不会出现在 oplog 中，或者所有事务都会被事务中止。因此，我们只是将分布式视为非分布式 -
+// 一旦遇到该 txn 的提交消息，就应用 opps。
+//
+// 可能会发生这样的情况：在 oplog 结束时，有一些分布式 txns 没有提交消息。仅当数据已满（观察到所有准备好的语句）并且该 txn
+// 至少由另一个分片提交时，我们才应该提交此类事务。为此，每个分片都会保存最后提交的 100 个 dist 事务，以便其他分片可以检查它们
+// 是否应该提交剩余的事务。我们存储最后 100 个，因为准备好的语句和提交可能会被其他 oplog 事件分开，因此可能会发生一些提交消息在
+// 某些分片上被删除但在其他分片上出现的情况。鉴于 dist txns 的 oplog 事件或多或少在[集群]时间内对齐，检查最后 100 个应该绰绰有余。
+//
+// 如果事务超过 16Mb，它将被分成多个准备好的消息。因此，可能会发生这样的情况：一个分片提交了 txn，但另一个分片在操作日志结束时观
+// 察到并非所有准备好的消息。在这种情况下，我们应该在日志中报告它并描述恢复。
 
 // By looking at just transactions in the oplog we can't tell which shards
 // were participating in it. But we can assume that if there is
@@ -341,6 +357,7 @@ func applyOplog(node *mongo.Client, chunks []pbm.OplogChunk, options *applyOplog
 		// and restore will fail with snappy: corrupt input. So we try S2 in such a case.
 		lts, err = replayChunk(chnk.FName, oplogRestore, stg, chnk.Compression)
 		if err != nil && errors.Is(err, snappy.ErrCorrupt) {
+			// mbp 版本兼容问题
 			lts, err = replayChunk(chnk.FName, oplogRestore, stg, compress.CompressionTypeS2)
 		}
 		if err != nil {

@@ -84,6 +84,7 @@ func (a *Agent) Start() error {
 	a.log.Printf("pbm-agent:\n%s", version.Current().All(""))
 	a.log.Printf("node: %s", a.node.ID())
 
+	// 监听 pbmCmd 表新插入的命令
 	c, cerr := a.pbm.ListenCmd(a.closeCMD)
 
 	a.log.Printf("listening for the commands")
@@ -428,6 +429,7 @@ type lockAquireFn func() (bool, error)
 
 // acquireLock tries to acquire the lock. If there is a stale lock
 // it tries to mark op that held the lock (backup, [pitr]restore) as failed.
+// acquireLock 尝试获取锁。如果存在过时的锁，它会尝试将持有该锁的操作（备份、[pitr]恢复）标记为失败。
 func (a *Agent) acquireLock(l *pbm.Lock, lg *log.Event, acquireFn lockAquireFn) (bool, error) {
 	if acquireFn == nil {
 		acquireFn = l.Acquire
@@ -487,6 +489,7 @@ func (a *Agent) HbStatus() {
 		l.Error("get mongo version: %v", err)
 	}
 
+	// 心跳消息内容
 	hb := pbm.AgentStat{
 		Node:       a.node.Name(),
 		RS:         a.node.RS(),
@@ -495,6 +498,7 @@ func (a *Agent) HbStatus() {
 		PerconaVer: nodeVersion.PSMDBVersion,
 	}
 	defer func() {
+		// 从 pbmAgents 表中删除 hb 心跳消息
 		if err := a.pbm.RemoveAgentStatus(hb); err != nil {
 			logger := a.log.NewEvent("agentCheckup", "", "", primitive.Timestamp{})
 			logger.Error("remove agent heartbeat: %v", err)
@@ -507,18 +511,23 @@ func (a *Agent) HbStatus() {
 	// check storage once in a while if all is ok (see https://jira.percona.com/browse/PBM-647)
 	const checkStoreIn = int(60 / (pbm.AgentsStatCheckRange / time.Second))
 	cc := 0
+	// 循环每隔 5 表执行一次
 	for range tk.C {
 		// don't check if on pause (e.g. physical restore)
+		// 物理恢复期间暂停心跳
 		if !a.HbIsRun() {
 			continue
 		}
 
+		// 获取 pbmClient 的状态，就是与 configsvr 分片的连接状态，ping
 		hb.PBMStatus = a.pbmStatus()
 		logHbStatus("PBM connection", hb.PBMStatus, l)
 
+		// 获取 agent 监听节点的状态，ping
 		hb.NodeStatus = a.nodeStatus()
 		logHbStatus("node connection", hb.NodeStatus, l)
 
+		// 每 12 次循环检查一下存储状态（s3..）
 		cc++
 		hb.StorageStatus = a.storStatus(l, cc == checkStoreIn)
 		logHbStatus("storage connection", hb.StorageStatus, l)
@@ -528,6 +537,7 @@ func (a *Agent) HbStatus() {
 
 		hb.Err = ""
 
+		// 获取 agent 监听节点对于所在 replset 的状态（mongodb 节点没问题但是连接 replset 集群存在问题的情况）
 		hb.State = pbm.NodeStateUnknown
 		hb.StateStr = "unknown"
 		n, err := a.node.Status()
@@ -539,6 +549,7 @@ func (a *Agent) HbStatus() {
 			hb.StateStr = n.StateStr
 		}
 
+		// 获取节点的类型，hidden？，arbiter？... （不同节点类型在备份中的权重是不一样的，在 agent 心跳中会更新类型的变化）
 		hb.Hidden = false
 		hb.Passive = false
 
@@ -552,6 +563,8 @@ func (a *Agent) HbStatus() {
 			hb.Arbiter = inf.ArbiterOnly
 		}
 
+		// 将心跳消息即 agent 状态写入到 pbmAgents 表: upset
+		//（每个 agent 在表中只有一个条记录，记录里面存在一个 Heartbeat 字段记录了此次心跳的 mongodb 集群时间戳，用于心跳超时）
 		err = a.pbm.SetAgentStatus(hb)
 		if err != nil {
 			l.Error("set status: %v", err)
@@ -577,6 +590,9 @@ func (a *Agent) nodeStatus() pbm.SubsysStatus {
 	return pbm.SubsysStatus{OK: true}
 }
 
+// 检查远程存储的状态，如果之前的检查没有问题或者不是强制检查则忽略，
+// 否则会通过读取远程存储中 .pbm.init 文件的状态信息来判断是否存在问题
+// (如果存在问题这里并没有将不正常状态写入 mongodb，应该在其他地方会写入)
 func (a *Agent) storStatus(log *log.Event, forceCheckStorage bool) pbm.SubsysStatus {
 	// check storage once in a while if all is ok (see https://jira.percona.com/browse/PBM-647)
 	// but if storage was(is) failed, check it always
@@ -593,8 +609,10 @@ func (a *Agent) storStatus(log *log.Event, forceCheckStorage bool) pbm.SubsysSta
 		return pbm.SubsysStatus{Err: fmt.Sprintf("unable to get storage: %v", err)}
 	}
 
+	// 检查远程存储中的 .pbm.init 文件（整个备份只有一个）
 	_, err = stg.FileStat(pbm.StorInitFile)
 	if errors.Is(err, storage.ErrNotExist) {
+		// 如果不存在则创建一个
 		err := stg.Save(pbm.StorInitFile, bytes.NewBufferString(version.Current().Version), 0)
 		if err != nil {
 			return pbm.SubsysStatus{

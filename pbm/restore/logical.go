@@ -490,6 +490,8 @@ func (r *Restore) chunks(from, to primitive.Timestamp) ([]pbm.OplogChunk, error)
 	return chunks(r.cn, r.stg, from, to, r.nodeInfo.SetName, r.rsMap)
 }
 
+// 得到 backupName 对应的备份快照元数据
+// 先从 pbmBackups 表里面查，没有就从存储文件 <backupName>/.pbm.json 获取
 func SnapshotMeta(cn *pbm.PBM, backupName string, stg storage.Storage) (*pbm.BackupMeta, error) {
 	bcp, err := cn.GetBackupMeta(backupName)
 	if errors.Is(err, pbm.ErrNotFound) {

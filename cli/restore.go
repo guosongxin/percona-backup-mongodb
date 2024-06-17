@@ -22,15 +22,20 @@ import (
 )
 
 type restoreOpts struct {
-	bcp      string
+	bcp string
+	// 恢复时间点
 	pitr     string
 	pitrBase string
 	wait     bool
-	extern   bool
-	ns       string
-	rsMap    string
-	conf     string
-	ts       string
+	// External backups only
+	extern bool
+	// logic backups only
+	ns    string
+	rsMap string
+	// mongod 配置文件路径
+	conf string
+	// External backups only
+	ts string
 }
 
 type restoreRet struct {
@@ -110,6 +115,7 @@ func runRestore(cn *pbm.PBM, o *restoreOpts, outf outFormat) (fmt.Stringer, erro
 	}
 	tdiff := time.Now().Unix() - int64(clusterTime.T)
 
+	// 发送 restore 命令并等待恢复开始
 	m, err := restore(cn, o, nss, rsMap, outf)
 	if err != nil {
 		return nil, err
@@ -122,6 +128,7 @@ func runRestore(cn *pbm.PBM, o *restoreOpts, outf outFormat) (fmt.Stringer, erro
 
 		return externRestoreRet{Name: m.Name, Snapshot: o.bcp}, nil
 	}
+	// 没有通过命令行传入 -w 则直接退出
 	if !o.wait {
 		return restoreRet{
 			Name:     m.Name,
@@ -135,6 +142,7 @@ func runRestore(cn *pbm.PBM, o *restoreOpts, outf outFormat) (fmt.Stringer, erro
 		typ = " physical restore.\nWaiting to finish"
 	}
 	fmt.Printf("Started%s", typ)
+	// 不断查看存储中保存的恢复状态并等待完成
 	err = waitRestore(cn, m, pbm.StatusDone, tdiff)
 	if err == nil {
 		return restoreRet{
@@ -168,6 +176,7 @@ func waitRestore(cn *pbm.PBM, m *pbm.RestoreMeta, status pbm.Status, tskew int64
 
 	var rmeta *pbm.RestoreMeta
 
+	// 从存储中获取恢复信息
 	getMeta := cn.GetRestoreMeta
 	if m.Type == pbm.PhysicalBackup || m.Type == pbm.IncrementalBackup {
 		getMeta = func(name string) (*pbm.RestoreMeta, error) {
@@ -232,6 +241,9 @@ func (e restoreFailedError) Is(err error) bool {
 	return ok
 }
 
+// 根据用户传入的恢复备份参数选择一个备份
+// 如果用户配置了 --base-snapshot 和按时间点恢复则使用 --base-snapshot 作为基础备份，否则使用 用户传入的备份名为基础备份
+// 如果没有指定基础备份则查找恢复时间点之前的最近的一次备份，使用此次备份
 func checkBackup(cn *pbm.PBM, o *restoreOpts, nss []string) (string, pbm.BackupType, error) {
 	if o.extern && o.bcp == "" {
 		return "", pbm.ExternalBackup, nil
@@ -281,10 +293,13 @@ func restore(
 	rsMapping map[string]string,
 	outf outFormat,
 ) (*pbm.RestoreMeta, error) {
+	// 根据用户传入的参数获取备份名和备份类型
 	bcp, bcpType, err := checkBackup(cn, o, nss)
 	if err != nil {
 		return nil, err
 	}
+	// 检查 rs 锁的竞争情况
+	// 存在一个有效的锁，则报错退出，否则继续进行（包括锁过期）
 	err = checkConcurrentOp(cn)
 	if err != nil {
 		return nil, err
@@ -331,6 +346,7 @@ func restore(
 		}
 	}
 
+	// 向 pbmCmd 表插入恢复命令信息
 	err = cn.SendCmd(cmd)
 	if err != nil {
 		return nil, errors.Wrap(err, "send command")
@@ -338,6 +354,7 @@ func restore(
 
 	if outf != outText {
 		return &pbm.RestoreMeta{
+			// 此次恢复的命令（用于查找此次恢复的状态）
 			Name:   name,
 			Backup: bcp,
 			Type:   bcpType,
@@ -382,6 +399,8 @@ func restore(
 	}
 	defer cancel()
 
+	// 从存储中获取 restore 状态
+	// 等待到 Running, DumpDone, Done, Error 状态则返回
 	return waitForRestoreStatus(ctx, name, fn)
 }
 

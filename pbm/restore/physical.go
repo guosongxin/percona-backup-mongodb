@@ -60,6 +60,7 @@ type PhysRestore struct {
 	cn     *pbm.PBM
 	node   *pbm.Node
 	dbpath string
+	// 在恢复期间重新启动 mongod 的临时端口
 	// an ephemeral port to restart mongod on during the restore
 	tmpPort int
 	tmpConf *os.File
@@ -124,7 +125,9 @@ func NewPhysical(cn *pbm.PBM, node *pbm.Node, inf *pbm.NodeInfo, rsMap map[strin
 		return nil, errors.Wrap(err, "get replset config")
 	}
 
+	// _id => host
 	var shards map[string]string
+	// configsrv name
 	var csvr string
 	if inf.IsSharded() {
 		ss, err := cn.GetShards()
@@ -149,6 +152,7 @@ func NewPhysical(cn *pbm.PBM, node *pbm.Node, inf *pbm.NodeInfo, rsMap map[strin
 		return nil, errors.New("undefined replica set")
 	}
 
+	// 获取一个本地随机可用端口号
 	tmpPort, err := peekTmpPort(opts.Net.Port)
 	if err != nil {
 		return nil, errors.Wrap(err, "peek tmp port")
@@ -224,6 +228,8 @@ func (r *PhysRestore) close(noerr, cleanup bool) {
 	}
 }
 
+// 1. 停止所有节点
+// 2. 删除 dbpath 路径下除 pbm.restore.log 外的所有文件
 func (r *PhysRestore) flush() error {
 	r.log.Debug("shutdown server")
 	rsStat, err := r.node.GetReplsetStatus()
@@ -231,6 +237,7 @@ func (r *PhysRestore) flush() error {
 		return errors.Wrap(err, "get replset status")
 	}
 
+	// 在分片集群下 configsrv 等待其他 rs shutdown
 	if r.nodeInfo.IsConfigSrv() {
 		r.log.Debug("waiting for shards to shutdown")
 		_, err := r.waitFiles(pbm.StatusDown, r.syncPathDataShards, false)
@@ -239,6 +246,8 @@ func (r *PhysRestore) flush() error {
 		}
 	}
 
+	// shutdown 单节点副本集
+	// 先 shutdown 非单节点副本集的非主节点，此时主节点会降级为 secondary，然后再 shutdown 降级后的主节点
 	for {
 		inf, err := r.node.GetInfo()
 		if err != nil {
@@ -259,12 +268,16 @@ func (r *PhysRestore) flush() error {
 		time.Sleep(time.Second * 1)
 	}
 
+	// 等待节点停止（检查到 <dbpath>/mongod.lock 长度为 0）
 	r.log.Debug("waiting for the node to shutdown")
 	err = waitMgoShutdown(r.dbpath)
 	if err != nil {
 		return errors.Wrap(err, "shutdown")
 	}
 
+	// 此时除 configsvr 外的所有节点全部 shutdown
+
+	// 如果节点停止前是一个主节点则修改存储中的 rs 状态为 down
 	if r.nodeInfo.IsPrimary {
 		err = r.stg.Save(r.syncPathRS+"."+string(pbm.StatusDown),
 			okStatus(), -1)
@@ -273,6 +286,9 @@ func (r *PhysRestore) flush() error {
 		}
 	}
 
+	// 此时所有节点全部 shutdown，所有 rs 状态设置为 down
+
+	// 删除 dbpath 路径下除 pbm.restore.log 外的所有文件
 	r.log.Debug("revome old data")
 	err = removeAll(r.dbpath, r.log)
 	if err != nil {
@@ -357,8 +373,10 @@ func waitMgoShutdown(dbpath string) error {
 //nolint:lll,nonamedreturns
 func (r *PhysRestore) toState(status pbm.Status) (_ pbm.Status, err error) {
 	defer func() {
+		// 如果当前节点是主节点并且有错误发生则设置错误状态
 		if err != nil {
 			if r.nodeInfo.IsPrimary && status != pbm.StatusDone {
+				// 设置 rs 状态为 error
 				serr := r.stg.Save(r.syncPathRS+"."+string(pbm.StatusError),
 					errStatus(err), -1)
 				if serr != nil {
@@ -366,6 +384,7 @@ func (r *PhysRestore) toState(status pbm.Status) (_ pbm.Status, err error) {
 				}
 			}
 			if r.nodeInfo.IsClusterLeader() && status != pbm.StatusDone {
+				// 设置 cluster 状态为 error
 				serr := r.stg.Save(r.syncPathCluster+"."+string(pbm.StatusError),
 					errStatus(err), -1)
 				if serr != nil {
@@ -383,6 +402,7 @@ func (r *PhysRestore) toState(status pbm.Status) (_ pbm.Status, err error) {
 		return pbm.StatusError, errors.Wrap(err, "write node state")
 	}
 
+	// rs 的主节点会等待 rs 其他节点 done 或状态与当前节点一致才会继续进行
 	if r.nodeInfo.IsPrimary || status == pbm.StatusDone {
 		r.log.Info("waiting for `%s` status in rs %v", status, r.syncPathPeers)
 		cstat, err := r.waitFiles(status, copyMap(r.syncPathPeers), false)
@@ -390,6 +410,7 @@ func (r *PhysRestore) toState(status pbm.Status) (_ pbm.Status, err error) {
 			return pbm.StatusError, errors.Wrap(err, "wait for nodes in rs")
 		}
 
+		// 修改 rs 状态
 		err = r.stg.Save(r.syncPathRS+"."+string(cstat),
 			okStatus(), -1)
 		if err != nil {
@@ -397,6 +418,7 @@ func (r *PhysRestore) toState(status pbm.Status) (_ pbm.Status, err error) {
 		}
 	}
 
+	// configsvr 主节点会等待其他 rs done 或状态与当前节点一致才会继续进行
 	if r.nodeInfo.IsClusterLeader() || status == pbm.StatusDone {
 		r.log.Info("waiting for shards %v", r.syncPathShards)
 		cstat, err := r.waitFiles(status, copyMap(r.syncPathShards), true)
@@ -404,6 +426,7 @@ func (r *PhysRestore) toState(status pbm.Status) (_ pbm.Status, err error) {
 			return pbm.StatusError, errors.Wrap(err, "wait for shards")
 		}
 
+		// 修改 cluster 状态
 		err = r.stg.Save(r.syncPathCluster+"."+string(cstat),
 			okStatus(), -1)
 		if err != nil {
@@ -502,12 +525,14 @@ func (r *PhysRestore) waitFiles(
 	var haveDone bool
 	for range tk.C {
 		for f := range objs {
+			// 读取节点 error 状态文件
 			errFile := f + "." + string(pbm.StatusError)
 			_, err := r.stg.FileStat(errFile)
 			if err != nil && !errors.Is(err, storage.ErrNotExist) {
 				return pbm.StatusError, errors.Wrapf(err, "get file %s", errFile)
 			}
 
+			// 读取节点 error 状态文件
 			if err == nil {
 				r, err := r.stg.SourceReader(errFile)
 				if err != nil {
@@ -527,6 +552,7 @@ func (r *PhysRestore) waitFiles(
 				continue
 			}
 
+			// 检查节点心跳，如果节点已经是 done 则忽视心跳过期，否则返回错误
 			err = r.checkHB(f + "." + syncHbSuffix)
 			if err != nil {
 				curErr = errors.Wrapf(err, "check heartbeat in %s.%s", f, syncHbSuffix)
@@ -646,6 +672,23 @@ func (l *logBuff) Flush() error {
 	return l.flush()
 }
 
+// 从物理快照中恢复数据
+//
+// 节点之间的初始同步和协调通过“admin.pbmRestore”元数据进行，就像逻辑恢复一样。
+// 但后来，由于 mongod 被关闭，状态同步通过存储进行（参见“PhysRestore.toState”）
+//
+// 与逻辑恢复不同，副本集的每个节点都参与物理恢复。
+// 这样，我们就可以避免恢复后节点之间的逻辑重新同步。集群中的每个节点执行以下操作：
+// - 存储当前的复制集配置和 mongod 端口。
+// - 检查备份并停止对数据库的所有例行写入。
+// - 停止 mongod 并清除 datadir。
+// - 将备份数据复制到数据目录。
+// - 在临时（tmp）端口上启动独立的 mongod 并重置一些内部数据，同时设置单节点复制集并将 oplogTruncateAfterPoint 设置为备份的“最后一次写入”。
+//   `oplogTruncateAfterPoint` 设置日志重播的时间。
+// - 启动独立的 mongod 从日志中恢复 oplog。
+// - 清理数据并将复制集配置重置为工作状态。
+// - 关闭 mongod 和代理（领导者还将元数据转储到存储）。
+
 // Snapshot restores data from the physical snapshot.
 //
 // Initial sync and coordination between nodes happens via `admin.pbmRestore`
@@ -684,6 +727,8 @@ func (r *PhysRestore) Snapshot(
 	stopAgentC chan<- struct{},
 	pauseHB func(),
 ) (err error) {
+	// =================== 增量备份/全量备份的处理 ===============================
+
 	l.Debug("port: %d", r.tmpPort)
 
 	meta := &pbm.RestoreMeta{
@@ -700,6 +745,7 @@ func (r *PhysRestore) Snapshot(
 	}
 
 	var progress nodeStatus
+	// 如果恢复过程中发生错误的收尾操作
 	defer func() {
 		// set failed status of node on error, but
 		// don't mark node as failed after the local restore succeed
@@ -710,6 +756,7 @@ func (r *PhysRestore) Snapshot(
 		r.close(err == nil, progress.is(restoreStared) && !progress.is(restoreDone))
 	}()
 
+	// 向 r 填充各种用于恢复的元数据，并且维持一个心跳连接
 	err = r.init(cmd.Name, opid, l)
 	if err != nil {
 		return errors.Wrap(err, "init")
@@ -720,6 +767,7 @@ func (r *PhysRestore) Snapshot(
 	}
 
 	if cmd.BackupName != "" {
+		// 版本兼容性检查，备份是否存在当前节点所在 rs 的数据
 		err = r.prepareBackup(cmd.BackupName)
 		if err != nil {
 			return err
@@ -735,14 +783,20 @@ func (r *PhysRestore) Snapshot(
 		meta.Type = r.bcp.Type
 	}
 
+	// =================== 按时间点恢复，oplog 处理 ===============================
+
 	var opChunks []pbm.OplogChunk
 	if !pitr.IsZero() {
+		// chunks 定义给定范围内的 oplog 切片块，确保其完整性（时间线是连续的 - 没有间隙），
+		// 检查存储上的相应文件，如果所有检查都通过，则返回块列表
 		opChunks, err = chunks(r.cn, r.stg, r.restoreTS, pitr, r.rsConf.ID, r.rsMap)
 		if err != nil {
 			return err
 		}
 	}
 
+	// 排序备份链
+	// meta.BcpChain: 基础备份 => 增量备份1 => 增量备份2...
 	if meta.Type == pbm.IncrementalBackup {
 		meta.BcpChain = make([]string, 0, len(r.files))
 		for i := len(r.files) - 1; i >= 0; i-- {
@@ -750,12 +804,14 @@ func (r *PhysRestore) Snapshot(
 		}
 	}
 
+	// 设置节点状态为 starting，并等待整个集群状态转变为 starting
 	_, err = r.toState(pbm.StatusStarting)
 	if err != nil {
 		return errors.Wrap(err, "move to running state")
 	}
 	l.Debug("%s", pbm.StatusStarting)
 
+	// 不再将日志写入 mongo pbmLog 表，而是将其转储到存储上
 	// don't write logs to the mongo anymore
 	// but dump it on storage
 	r.cn.Logger().SefBuffer(&logBuff{
@@ -771,6 +827,7 @@ func (r *PhysRestore) Snapshot(
 		return errors.Wrapf(err, "moving to state %s", pbm.StatusRunning)
 	}
 
+	// agent 停止监听 cmd 流，agent 将退出主循环，一旦恢复动作执行完成就会退出 agent
 	// On this stage, the agent has to be closed on any outcome as mongod
 	// is gonna be turned off. Besides, the agent won't be able to listen to
 	// the cmd stream anymore and will flood logs with errors on that.
@@ -848,6 +905,8 @@ func (r *PhysRestore) Snapshot(
 		}
 	}
 
+	// 设置临时 mongod 配置文件
+	// 从备份元数据中设置配置文件并保存到一个临时目录下
 	if o, ok := cmd.ExtConf[r.nodeInfo.SetName]; ok {
 		excfg = &o
 	}
@@ -1740,6 +1799,7 @@ func (r *PhysRestore) startMongo(opts ...string) error {
 
 const hbFrameSec = 60 * 2
 
+// 从pbm配置表和存储中获取各种用于恢复的元数据，并创建一个心跳（通过在存储中的指定文件写入时间戳），心跳维持 node，rs 和 cluster
 func (r *PhysRestore) init(name string, opid pbm.OPID, l *log.Event) error {
 	cfg, err := r.cn.GetConfig()
 	if err != nil {
@@ -1938,6 +1998,13 @@ func (r *PhysRestore) setTmpConf(xopts *pbm.MongodOpts) error {
 
 const bcpDir = "__dir__"
 
+// 设置恢复期间必须复制到目标的 replset 文件。对于非增量备份，它只是备份文件（数据）和日志的内容。
+// 对于增量，它将收集从目标备份到最近的备份的先前备份中的文件。
+// `Off == -1 && Len == -1` 表示文件自上次备份以来保持不变，并且本次备份中没有数据。
+// 我们需要目标备份中的此类信息来了解应该恢复之前备份中的哪些文件。仅恢复目标备份中列出的文件。
+//
+// 恢复应按相反顺序进行。从基础备份开始应用文件（增量备份）并及时前进到目标备份。
+
 // Sets replset files that have to be copied to the target during the restore.
 // For non-incremental backups it's just the content of backups files (data) and
 // journals. For the incrementals, it will gather files from preceding backups
@@ -1952,18 +2019,24 @@ const bcpDir = "__dir__"
 func (r *PhysRestore) setBcpFiles() error {
 	bcp := r.bcp
 
+	// 根据节点名和 rs 结构映射获取当前的 rs name
 	setName := pbm.MakeReverseRSMapFunc(r.rsMap)(r.nodeInfo.SetName)
+	// 根据 rs name 获取 这个 rs 的元数据信息
 	rs := getRS(bcp, setName)
 	if rs == nil {
 		return errors.Errorf("no data in the backup for the replica set %s", setName)
 	}
 
+	// 将当前 backup 的文件列表放入 targetFiles （后续向上查找原备份信息只记录这些文件）
+	// filename => 这些文件是否存在内容（有可能有些文件备份了，但是没有内容，所以后续跳过这些文件）
 	targetFiles := make(map[string]bool)
 	for _, f := range append(rs.Files, rs.Journal...) {
 		targetFiles[f.Name] = false
 	}
 
+	// 向上搜索找到原始的全量备份，此时 bcp 指向这个全量备份
 	for {
+		// 封装为 (backupName, files)
 		data := files{
 			BcpName: bcp.Name,
 			Cmpr:    bcp.Compression,
@@ -1987,19 +2060,28 @@ func (r *PhysRestore) setBcpFiles() error {
 
 		r.files = append(r.files, data)
 
+		// SrcBackup 标识这个备份的来源（增量备份会存在一个来源，这个来源也可能是一个增量备份，就像一个链表最终会指向一个全量备份）
+		// 如果已经是一个增量备份了则退出（目的是为了找到增量备份到全量备份之间的所有增量备份文件）
 		if bcp.SrcBackup == "" {
 			break
 		}
 
 		r.log.Debug("get src %s", bcp.SrcBackup)
 		var err error
+		// 获取此备份指向的前一个备份
 		bcp, err = r.cn.GetBackupMeta(bcp.SrcBackup)
 		if err != nil {
 			return errors.Wrapf(err, "get source backup")
 		}
+		// 获取此备份的当前的 rs 元数据
 		rs = getRS(bcp, setName)
 	}
 
+	// 仅限目录。增量 $backupCusor 返回已创建但尚未在检查点中结束的集合格式，如果它们不属于此备份（参见 PBM-1063）。
+	// PBM 不会复制此类文件。但它们已经在 WT 元数据中。PSMDB (WT) 通过在启动过程中创建此类文件来处理这个问题。
+	// 但如果使用 `directoryPerDB` 选项运行，则会失败。也就是说，无法为数据集创建目录。
+	// 因此，我们必须在还原过程中检测并创建这些目录。
+	//
 	// Directories only. Incremental $backupCusor returns collections that
 	// were created but haven't ended up in the checkpoint yet in the format
 	// if they don't belong to this backup (see PBM-1063). PBM doesn't copy
@@ -2026,6 +2108,7 @@ func (r *PhysRestore) setBcpFiles() error {
 	}
 
 	if len(dirs) > 0 {
+		// 只是为了让文件拷贝过程中创建这个文件夹
 		r.files = append(r.files, files{
 			BcpName: bcpDir,
 			Data:    dirs,
@@ -2070,6 +2153,7 @@ func getRS(bcp *pbm.BackupMeta, rs string) *pbm.BackupReplset {
 
 func (r *PhysRestore) prepareBackup(backupName string) error {
 	var err error
+	// 填充 backup meta 向 r
 	r.bcp, err = r.cn.GetBackupMeta(backupName)
 	if errors.Is(err, pbm.ErrNotFound) {
 		r.bcp, err = GetMetaFromStore(r.stg, backupName)
@@ -2082,6 +2166,7 @@ func (r *PhysRestore) prepareBackup(backupName string) error {
 		return errors.New("snapshot name doesn't set")
 	}
 
+	// 向 pbmRestores 表更新此次恢复的备份名
 	err = r.cn.SetRestoreBackup(r.name, r.bcp.Name, nil)
 	if err != nil {
 		return errors.Wrap(err, "set backup name")
@@ -2091,6 +2176,7 @@ func (r *PhysRestore) prepareBackup(backupName string) error {
 		return errors.Errorf("backup wasn't successful: status: %s, error: %s", r.bcp.Status, r.bcp.Error())
 	}
 
+	// 检查给定版本是否与当前版本兼容
 	if !version.CompatibleWith(r.bcp.PBMVersion, pbm.BreakingChangesMap[r.bcp.Type]) {
 		return errors.Errorf("backup version (v%s) is not compatible with PBM v%s",
 			r.bcp.PBMVersion, version.Current().Version)
@@ -2101,17 +2187,24 @@ func (r *PhysRestore) prepareBackup(backupName string) error {
 		return errors.Wrap(err, "define mongo version")
 	}
 
+	// cmd: buildInfo
+	// 比较备份的 mongo 主版本号是否于当前 mongo 主版本号相同 majmin("v2.1.0") == "v2.1"
 	if semver.Compare(majmin(r.bcp.MongoVersion), majmin(mgoV.VersionString)) != 0 {
 		return errors.Errorf("backup's Mongo version (%s) is not compatible with Mongo %s",
 			r.bcp.MongoVersion, mgoV.VersionString)
 	}
 
+	// cmd: mongod --version
+	// 确保用于内部重启的 mongod 可用并且与备份的版本匹配
 	mv, err := r.checkMongod(r.bcp.MongoVersion)
 	if err != nil {
 		return errors.Wrap(err, "check mongod binary")
 	}
 	r.log.Debug("mongod binary: %s, version: %s", r.mongod, mv)
 
+	// 将恢复需要的所有文件列表保存到 r 中，待恢复使用
+	// 如果是增量备份会将基于的全量备份到这个增量备份之间的所有备份文件存入其中
+	// 如果本身是一个全量备份则只保存这个全量备份的文件
 	err = r.setBcpFiles()
 	if err != nil {
 		return errors.Wrap(err, "get data for restore")
@@ -2122,12 +2215,15 @@ func (r *PhysRestore) prepareBackup(backupName string) error {
 		return errors.Wrap(err, "get cluster members")
 	}
 
+	// fl: rs name => pbm.Shard
+	// MakeReverseRSMapFunc 的作用：k: v => v: k
 	mapRevRS := pbm.MakeReverseRSMapFunc(r.rsMap)
 	fl := make(map[string]pbm.Shard, len(s))
 	for _, rs := range s {
 		fl[mapRevRS(rs.RS)] = rs
 	}
 
+	// 检查当前集群是否存在备份数据中的所有 rs
 	var nors []string
 	for _, sh := range r.bcp.Replsets {
 		if _, ok := fl[sh.Name]; !ok {
@@ -2139,6 +2235,7 @@ func (r *PhysRestore) prepareBackup(backupName string) error {
 		return errors.Errorf("extra/unknown replica set found in the backup: %s", strings.Join(nors, ","))
 	}
 
+	// 获取当前节点所在的 rs 是否在备份数据中存在
 	setName := mapRevRS(r.nodeInfo.SetName)
 	var ok bool
 	for _, v := range r.bcp.Replsets {
@@ -2227,6 +2324,7 @@ func (r *PhysRestore) MarkFailed(meta *pbm.RestoreMeta, e error, markCluster boo
 	}
 }
 
+// 删除 dbpath 路径下除 pbm.restore.log 外的所有文件
 func removeAll(dir string, l *log.Event) error {
 	d, err := os.Open(dir)
 	if err != nil {

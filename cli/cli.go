@@ -153,8 +153,10 @@ func Main() {
 
 	restoreCmd := pbmCmd.Command("restore", "Restore backup")
 	restore := restoreOpts{}
+	// 恢复到某个备份的备份名
 	restoreCmd.Arg("backup_name", "Backup name to restore").
 		StringVar(&restore.bcp)
+	// 基于时间点恢复，基于 backup_name 备份恢复到某个时间点
 	restoreCmd.Flag("time", fmt.Sprintf("Restore to the point-in-time. Set in format %s", datetimeFormat)).
 		StringVar(&restore.pitr)
 	restoreCmd.Flag("base-snapshot",

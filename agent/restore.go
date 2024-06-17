@@ -48,6 +48,7 @@ const pitrCheckPeriod = time.Second * 15
 func (a *Agent) PITR() {
 	a.log.Printf("starting PITR routine")
 
+	// 每 15 秒执行一次，遇到错误等待时间设置为两倍（让其他健康的节点优先）
 	for {
 		wait := pitrCheckPeriod
 
@@ -95,6 +96,7 @@ func (a *Agent) pitr() error {
 		return errors.Wrap(err, "get conf")
 	}
 
+	// 如果 oplogOnly 配置发生更变则停止 pitr
 	a.stopPitrOnOplogOnlyChange(cfg.PITR.OplogOnly)
 	p := a.getPitr()
 
@@ -105,6 +107,7 @@ func (a *Agent) pitr() error {
 		return nil
 	}
 
+	// TODO(study): 记录在了 pbmConfig 表里的一个时间戳，似乎只在打印日志时使用了，啥时候更新的？只是为同步打印日志的时间？
 	ep, err := a.pbm.GetEpoch()
 	if err != nil {
 		return errors.Wrap(err, "get epoch")
@@ -112,6 +115,7 @@ func (a *Agent) pitr() error {
 
 	l := a.log.NewEvent(string(pbm.CmdPITR), "", "", ep.TS())
 
+	// 获取备份 oplog 的时间跨度
 	spant := time.Duration(cfg.PITR.OplogSpanMin * float64(time.Minute))
 	if spant == 0 {
 		spant = pbm.PITRdefaultSpan
@@ -126,6 +130,7 @@ func (a *Agent) pitr() error {
 			p.slicer.SetSpan(spant)
 
 			// wake up slicer only if span became smaller
+			// 如果配置发生变更，备份 oplog 时间跨度变小了，则唤醒切片器（oplog 切片器）尝试备份 oplog 到存储
 			if spant < cspan {
 				a.pitrjob.w <- nil
 			}
@@ -136,6 +141,7 @@ func (a *Agent) pitr() error {
 
 	// just a check before a real locking
 	// just trying to avoid redundant heavy operations
+	// 检查一下当前的 rs 是否可以获取锁
 	moveOn, err := a.pitrLockCheck()
 	if err != nil {
 		return errors.Wrap(err, "check if already run")
@@ -154,6 +160,7 @@ func (a *Agent) pitr() error {
 	if err != nil {
 		return errors.Wrap(err, "get node info")
 	}
+	// 检查当前节点是否适合备份，如果不合适则退出，由其他节点进行 pitr 备份
 	q, err := backup.NodeSuits(a.node, ninf)
 	if err != nil {
 		return errors.Wrap(err, "node check")
@@ -164,6 +171,7 @@ func (a *Agent) pitr() error {
 		return nil
 	}
 
+	// 从 pbmConfig 表读取存储配置并返回对应的存储抽象
 	stg, err := a.pbm.GetStorage(l)
 	if err != nil {
 		return errors.Wrap(err, "unable to get storage configuration")
@@ -189,9 +197,13 @@ func (a *Agent) pitr() error {
 	ibcp := pitr.NewSlicer(a.node.RS(), a.pbm, a.node, stg, ep)
 	ibcp.SetSpan(spant)
 
+	// 设置分片器 oplog 开始时间
 	if cfg.PITR.OplogOnly {
+		// 不需要存在一个全量备份
+		// 起始时间：如果存在上次 pitr 备份则设置为上一次的结束时间否则设置为当前的集群时间
 		err = ibcp.OplogOnlyCatchup()
 	} else {
+		// 必须存在一个全量备份
 		err = ibcp.Catchup()
 	}
 	if err != nil {
@@ -237,6 +249,7 @@ func (a *Agent) pitr() error {
 	return nil
 }
 
+// 检查 rs 是否没有被上锁（即此时可以尝试获取 rs 锁）
 func (a *Agent) pitrLockCheck() (bool, error) {
 	ts, err := a.pbm.ClusterTime()
 	if err != nil {
@@ -287,6 +300,8 @@ func (a *Agent) Restore(r *pbm.RestoreCmd, opid pbm.OPID, ep pbm.Epoch) {
 			Epoch:   &epts,
 		})
 
+		// 探测一下锁是否存在，即恢复操作的前一个命令是否完成
+		// 如果没有则退出此次命令执行，等待下次再继续
 		got, err := a.acquireLock(lock, l, nil)
 		if err != nil {
 			l.Error("acquiring lock: %v", err)
@@ -328,6 +343,7 @@ func (a *Agent) Restore(r *pbm.RestoreCmd, opid pbm.OPID, ep pbm.Epoch) {
 			return
 		}
 
+		// 按时间点恢复的时间点在备份之前报错
 		if !r.OplogTS.IsZero() && bcp.LastWriteTS.Compare(r.OplogTS) >= 0 {
 			l.Error("snapshot's last write is later than the target time. " +
 				"Try to set an earlier snapshot. Or leave the snapshot empty so PBM will choose one.")

@@ -63,8 +63,14 @@ func (s *Slicer) GetSpan() time.Duration {
 // If there is a chunk behind the last backup it will try to fill the gaps from the chunk to the starting point.
 // While filling gaps it checks the oplog for sufficiency. It also checks if there is no restore intercepted
 // the timeline (hence there are no restores after the most recent backup)
+//
+// Catchup 寻找最后保存（备份）的 TS - 起点。
+// 仅当时间线丢失时（例如（重新）启动、备份后重新启动、节点失败），才应运行它。
+// 起始点设置为最后一个备份或最后一个 PITR 块的 TS，以最新者为准。如果上次备份后面有一个块，它将尝试填充从该块到起始点的间隙。
+// 在填补空白的同时，它会检查 oplog 是否充足。它还会检查时间线是否没有截取还原（因此最近一次备份后没有还原）。
 func (s *Slicer) Catchup() error {
 	s.l.Debug("start_catchup")
+	// 获取最新的一个备份信息 (physical | incremental | logical)
 	baseBcp, err := s.pbm.GetLastBackup(nil)
 	if errors.Is(err, pbm.ErrNotFound) {
 		return errors.New("no backup found. full backup is required to start PITR")
@@ -81,6 +87,8 @@ func (s *Slicer) Catchup() error {
 	if err != nil && !errors.Is(err, pbm.ErrNotFound) {
 		return errors.Wrap(err, "get last restore")
 	}
+	// 时间线丢失 (最后一次备份~最后一次恢复的 oplog 丢失了)
+	// 已最后一次恢复作为时间起点，因为时间起点后没有全量备份所以无法进行 pitr
 	if rstr != nil && rstr.StartTS > baseBcp.StartTS {
 		return errors.Errorf("no backup found after the restored %s, a new backup is required to resume PITR", rstr.Backup)
 	}
@@ -96,27 +104,34 @@ func (s *Slicer) Catchup() error {
 		return nil
 	}
 
+	// 最近的 pitr 备份在最近的全量备份后面，则直接将最近的 pitr 结束时间作为此次 pitr 备份的起始时间
 	// PITR chunk after the recent backup is the most recent oplog slice
 	if chnk.EndTS.Compare(baseBcp.LastWriteTS) >= 0 {
 		s.lastTS = chnk.EndTS
 		return nil
 	}
 
+	// 最近的一次 pitr 在最后一次恢复前，说明 pitr 是属于恢复前的 pitr，忽略这个 pitr，直接从最近一次备份结束时间开始
 	if rstr != nil && rstr.StartTS > int64(chnk.StartTS.T) {
 		s.l.Info("restore `%s` is after the chunk `%s`, skip", rstr.Backup, chnk.FName)
 		return nil
 	}
 
+	// 获取从最后一个 pitr 备份结束时间之后的所有备份
 	bl, err := s.pbm.BackupsDoneList(&chnk.EndTS, 0, -1)
 	if err != nil {
 		return errors.Wrapf(err, "get backups list from %v", chnk.EndTS)
 	}
 
+	// 如果期间存在多个全量备份则不再尝试填充最后一个 pitr 备份结束时间到最后全量备份之间的间隙
+	// 直接从最后一个全量备份结束时间开始
 	if len(bl) > 1 {
 		s.l.Debug("chunk too far (more than a one snapshot)")
 		return nil
 	}
 
+	// 如果最后一个 pitr 备份结束时间到最后一次全量备份之间没有其他全量备份，这尝试填充这个间隙（上传这个间隙内的 oplog）
+	// 如果可以填充失败就算了，还是从最后一次全量备份结束开始
 	// if there is a gap between chunk and the backup - fill it
 	// failed gap shouldn't prevent further chunk creation
 	if chnk.EndTS.Compare(baseBcp.FirstWriteTS) < 0 {
@@ -135,6 +150,7 @@ func (s *Slicer) Catchup() error {
 			return errors.Wrap(err, "get config")
 		}
 
+		// 上传 [chnk.EndTS, baseBcp.FirstWriteTS] 之间的 oplog 到存储，并保存 pitr 块信息到 pbmPITRChunks 表中
 		err = s.upload(chnk.EndTS, baseBcp.FirstWriteTS, cfg.PITR.Compression, cfg.PITR.CompressionLevel)
 		if err != nil {
 			s.l.Warning("create last_chunk<->sanpshot slice: %v", err)
@@ -148,6 +164,7 @@ func (s *Slicer) Catchup() error {
 		}
 	}
 
+	// TODO(study): why?
 	if baseBcp.Type != pbm.LogicalBackup || sel.IsSelective(baseBcp.Namespaces) {
 		// the backup does not contain complete oplog to copy from
 		// NOTE: the chunk' last op can be later than backup' first write ts
@@ -155,6 +172,7 @@ func (s *Slicer) Catchup() error {
 		return nil
 	}
 
+	// 如果最近的备份是一个逻辑备份则将此逻辑备份执行过程中产生的 oplog 也拷贝到存储中
 	err = s.copyFromBcp(baseBcp)
 	if err != nil {
 		s.l.Warning("copy snapshot [%s] oplog: %v", baseBcp.Name, err)
@@ -175,12 +193,14 @@ func (s *Slicer) OplogOnlyCatchup() (err error) {
 		}
 	}()
 
+	// 从 pbmPITRChunks 表中读取上一次 pitr 备份的记录
 	chnk, err := s.pbm.PITRLastChunkMeta(s.rs)
 	if err != nil && !errors.Is(err, pbm.ErrNotFound) {
 		return errors.Wrap(err, "get last slice")
 	}
 
 	if chnk != nil {
+		// 检查是 oplog 是否足够可以从 EndTS 开始
 		ok, err := s.oplog.IsSufficient(chnk.EndTS)
 		if err != nil {
 			s.l.Warning("check oplog sufficiency for %s: %v", chnk, err)
@@ -428,6 +448,7 @@ func (s *Slicer) Stream(
 
 func (s *Slicer) upload(from, to primitive.Timestamp, compression compress.CompressionType, level *int) error {
 	s.oplog.SetTailingSpan(from, to)
+	// 拼接存储中保存的 oplog 文件绝对路径
 	fname := s.chunkPath(from, to, compression)
 	// if use parent ctx, upload will be canceled on the "done" signal
 	size, err := backup.Upload(context.Background(), s.oplog, s.storage, compression, level, fname, -1)
@@ -444,6 +465,7 @@ func (s *Slicer) upload(from, to primitive.Timestamp, compression compress.Compr
 		return errors.Wrapf(err, "unable to upload chunk %v.%v", from, to)
 	}
 
+	// 将上传完成的 oplog 块信息保存到 pbmPITRChunks 中
 	meta := pbm.OplogChunk{
 		RS:          s.rs,
 		FName:       fname,

@@ -18,7 +18,8 @@ type listOpts struct {
 	unbacked bool
 	full     bool
 	size     int
-	rsMap    string
+	// 备份数据里的 rs => 集群的 rs
+	rsMap string
 }
 
 type restoreStatus struct {

@@ -67,6 +67,7 @@ func (a *Agent) Backup(cmd *pbm.BackupCmd, opid pbm.OPID, ep pbm.Epoch) {
 		return
 	}
 
+	// 是否为主节点
 	isClusterLeader := nodeInfo.IsClusterLeader()
 	canRunBackup, err := backup.NodeSuitsExt(a.node, nodeInfo, cmd.Type)
 	if err != nil {

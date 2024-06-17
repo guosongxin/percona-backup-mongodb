@@ -214,6 +214,9 @@ func checkFile(stg storage.Storage, filename string) error {
 	return nil
 }
 
+// 获取物理恢复的元数据，元数据有两部分来源
+// 1. 来自于存储文件 .pbm.restore/<restore_name>.json
+// 2. 来自存储目录 .pbm.restore/<restore_name>/..
 func GetPhysRestoreMeta(restore string, stg storage.Storage, l *log.Event) (*RestoreMeta, error) {
 	mjson := filepath.Join(PhysRestoresDir, restore) + ".json"
 	_, err := stg.FileStat(mjson)
@@ -234,6 +237,7 @@ func GetPhysRestoreMeta(restore string, stg storage.Storage, l *log.Event) (*Res
 		}
 	}
 
+	// 从存储中解析此次恢复的状态信息
 	condsm, err := ParsePhysRestoreStatus(restore, stg, l)
 	if err != nil {
 		return rmeta, errors.Wrap(err, "parse physical restore status")
@@ -276,6 +280,13 @@ func ParsePhysRestoreStatus(restore string, stg storage.Storage, l *log.Event) (
 	})
 
 	for _, f := range rfiles {
+		// f.Name 为如下可能:
+		// rs.<rs-name>/
+		//     node.<node-name>.hb
+		//     node.<node-name>.<status>
+		// rs.<status>
+		// cluster.hb
+		// cluster.<status>
 		parts := strings.SplitN(f.Name, ".", 2)
 		if len(parts) != 2 {
 			continue
@@ -288,6 +299,7 @@ func ParsePhysRestoreStatus(restore string, stg storage.Storage, l *log.Event) (
 				continue
 			}
 
+			// rs.<rs-name>
 			rsName := strings.TrimPrefix(rsparts[0], "rs.")
 			rs, ok := rss[rsName]
 			if !ok {
@@ -295,6 +307,8 @@ func ParsePhysRestoreStatus(restore string, stg storage.Storage, l *log.Event) (
 				rs.nodes = make(map[string]RestoreNode)
 			}
 
+			// node.<node-name>.hb
+			// node.<node-name>.<status>
 			p := strings.Split(rsparts[1], ".")
 
 			if len(p) < 2 {
